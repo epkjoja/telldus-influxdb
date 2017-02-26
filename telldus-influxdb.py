@@ -2,11 +2,9 @@
 
 import json
 import oauth.oauth as oauth
-import os
 import requests
 import sys
 import time
-import threading
 import logging
 from daemon import runner
 
@@ -29,13 +27,15 @@ INTERVAL = 600
 PIDFILE = '/var/run/telldus-influxdb.pid'
 LOGFILE = '/var/log/telldus-influxdb.log'
 
+class TelldusError(Exception):
+    pass
+
+class InfluxDbError(Exception):
+    pass
 
 # Mostly taken from https://github.com/rlnrln/telldus-exporter
 class TelldusLive:
 
-    def __init__(self):
-        pass
-    
     def get(self, method, params=None):
         consumer = oauth.OAuthConsumer(public_key, private_key)
 
@@ -51,7 +51,7 @@ class TelldusLive:
 
         if response.status_code != 200:
             logger.error("Failed to read from TelldusLive: " + response.text)
-            raise Exception(response.text)
+            raise TelldusError(response.text)
 
         return json.loads(response.text)
 
@@ -66,6 +66,7 @@ class InfluxDB:
         self._password = password
         self._database = database
 
+        
     def write(self, measurement, tags, fields, time=None):
         data = measurement
         
@@ -88,14 +89,33 @@ class InfluxDB:
 
         if response.status_code != 204:
             logger.error("Failed to write to InfluxDb: " + response.text)
-            raise Exception("Failed to write to InfluxDb")
+            raise InfluxDbError("Failed to write to InfluxDb")
 
         logger.info("Measurement for %s saved" % measurement)
         
         
-# Daemon code from http://www.gavinj.net/2012/06/building-python-daemon-process.html
 class TelldusInfluxDb:
-    
+
+    def __init__(self, telldus, influxdb):
+        self._telldus = telldus
+        self._influxdb = influxdb
+
+        
+    def saveSensors(self):
+        for sensor in self._telldus.get('sensors/list')['sensor']:
+            sensordata = self._telldus.get('sensor/info', params = { 'id': sensor['id'] })
+
+            tags = { 'sensorId': sensor['id'], 'name': sensor['name'] }
+            fields = { 'battery': sensordata['battery']}
+            
+            for data in sensordata['data']:
+                fields.update({ data['name']: data['value'] })
+
+            self._influxdb.write(sensor['clientName'], tags, fields)
+
+        
+# Daemon code from http://www.gavinj.net/2012/06/building-python-daemon-process.html
+class Daemonize:
     def __init__(self):
         self.stdin_path = '/dev/null'
         self.stdout_path = '/dev/null'
@@ -104,29 +124,22 @@ class TelldusInfluxDb:
         self.pidfile_timeout = 5
         
     def run(self):
+        logger.info("Daemon starting")
         telldus = TelldusLive()
         influx = InfluxDB(host, port, user, password, dbname)
-
+        handler = TelldusInfluxDb(telldus, influx)
+        
         while True:
-            for sensor in telldus.get('sensors/list')['sensor']:
-                sensordata = telldus.get('sensor/info', params = { 'id': sensor['id'] })
-
-                tags = { 'sensorId': sensor['id'], 'name': sensor['name'] }
-                fields = { 'battery': sensordata['battery']}
-                
-                for data in sensordata['data']:
-                    fields.update({ data['name']: data['value'] })
-
-                influx.write(sensor['clientName'], tags, fields)
+            try:
+                handler.saveSensors()
+            except (TelldusError, InfluxDbError):
+                logger.error("Failed to fetch/save sensors! Will try again in next interval.")
 
             # The daemon will repeat your tasks according to this variable
             time.sleep(INTERVAL)
 
 
 if __name__ == "__main__":
-
-    daemon = TelldusInfluxDb()
-
     logger = logging.getLogger("telldus-influxdb")
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -134,8 +147,20 @@ if __name__ == "__main__":
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
-    daemon_runner = runner.DaemonRunner(daemon)
+    if "run-once" in sys.argv:
+        telldus = TelldusLive()
+        influx = InfluxDB(host, port, user, password, dbname)
+        handler = TelldusInfluxDb(telldus, influx)
+        handler.saveSensors()
+    else:
+        daemon = Daemonize()
+        daemon_runner = runner.DaemonRunner(daemon)
     
-    # This ensures that the logger file handle does not get closed during daemonization
-    daemon_runner.daemon_context.files_preserve=[handler.stream]
-    daemon_runner.do_action()
+        # This ensures that the logger file handle does not get closed during daemonization
+        daemon_runner.daemon_context.files_preserve=[handler.stream]
+
+        try:
+            daemon_runner.do_action()
+            logger.info("Daemon stopping")
+        except Exception as ex:
+            logger.info("Daemon stopping! " + ex)
